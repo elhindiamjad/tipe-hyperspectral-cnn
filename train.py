@@ -3,9 +3,12 @@
 Usage:
     python train.py                       # default settings
     python train.py --epochs 100 --lr 5e-4
+    python train.py --split spatial --out-dir results/spatial
+    python train.py --seeds 0 1 2 3 4       # one run per seed + mean / std in summary.json
 """
 import argparse
 import json
+import statistics
 from pathlib import Path
 
 import torch
@@ -13,7 +16,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from hsi_cnn.data import (CLASS_NAMES, all_pixels, labeled_pixels, load_indian_pines,
-                          normalize_bands, pad_cube, split_indices)
+                          block_split_indices, normalize_bands, pad_cube,
+                          spatial_split_indices, split_indices)
 from hsi_cnn.dataset import PatchDataset
 from hsi_cnn.engine import evaluate, predict, train_one_epoch
 from hsi_cnn.metrics import compute_metrics
@@ -33,26 +37,45 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--test-size", type=float, default=0.3)
     p.add_argument("--val-size", type=float, default=0.1)
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--split", choices=["random", "blocks", "spatial"], default="random",
+                   help="random: stratified pixel split; blocks: disjoint blocks of the image; "
+                        "spatial: disjoint regions of each class (stratified)")
+    p.add_argument("--block-size", type=int, default=16, help="block side for --split blocks")
+    p.add_argument("--buffer", type=int, default=None,
+                   help="for spatial splits: drop train/val pixels this close to a test pixel "
+                        "(default: patch_size // 2)")
+    p.add_argument("--seeds", "--seed", type=int, nargs="+", default=[42],
+                   help="one or several seeds; with several, results are averaged")
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
-    set_seed(args.seed)
+def run(args, seed, out):
+    """Train and evaluate one model with the given seed. Return the test metrics."""
+    set_seed(seed)
     device = get_device()
-    out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    print(f"Device: {device}")
+    print(f"Device: {device} | seed {seed}")
 
     # 1. Data
     cube, gt = load_indian_pines(args.data_dir)
     cube = normalize_bands(cube)
     padded = pad_cube(cube, args.patch_size // 2)
     coords, labels = labeled_pixels(gt)
-    idx_train, idx_val, idx_test = split_indices(labels, args.test_size, args.val_size, args.seed)
+    if args.split == "random":
+        idx_train, idx_val, idx_test = split_indices(labels, args.test_size, args.val_size, seed)
+    else:
+        buffer = args.patch_size // 2 if args.buffer is None else args.buffer
+        if args.split == "blocks":
+            idx_train, idx_val, idx_test = block_split_indices(
+                coords, gt.shape, args.test_size, args.val_size, args.block_size, buffer, seed)
+        else:
+            idx_train, idx_val, idx_test = spatial_split_indices(
+                coords, labels, gt.shape, args.test_size, args.val_size, buffer, seed)
     print(f"Cube {cube.shape} | labeled pixels: {len(labels)} "
           f"(train {len(idx_train)}, val {len(idx_val)}, test {len(idx_test)})")
+    missing = [CLASS_NAMES[k] for k in range(len(CLASS_NAMES)) if not (labels[idx_train] == k).any()]
+    if missing:
+        print(f"Classes without training pixels: {', '.join(missing)}")
 
     def loader(idx, shuffle):
         ds = PatchDataset(padded, coords[idx], args.patch_size, labels[idx])
@@ -89,7 +112,7 @@ def main():
     model.load_state_dict(torch.load(ckpt, map_location=device))
     _, _, preds, trues = evaluate(model, test_loader, criterion, device)
     metrics = compute_metrics(trues, preds, num_classes)
-    metrics.update(best_epoch=best_epoch, best_val_acc=best_val_acc, config=vars(args))
+    metrics.update(best_epoch=best_epoch, best_val_acc=best_val_acc, seed=seed, config=vars(args))
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
     # 5. Classification map of the whole scene
@@ -107,6 +130,26 @@ def main():
     print(f"Test AA    : {metrics['average_accuracy']:.4f}")
     print(f"Test kappa : {metrics['kappa']:.4f}")
     print(f"Results saved in {out}/")
+    return metrics
+
+
+def main():
+    args = parse_args()
+    out = Path(args.out_dir)
+    if len(args.seeds) == 1:
+        run(args, args.seeds[0], out)
+        return
+
+    runs = [run(args, seed, out / f"seed_{seed}") for seed in args.seeds]
+    summary = {"seeds": args.seeds, "config": vars(args)}
+    print(f"\nSummary over {len(runs)} seeds ({args.split} split):")
+    for key in ("overall_accuracy", "average_accuracy", "kappa"):
+        values = [m[key] for m in runs]
+        summary[key] = {"mean": statistics.mean(values), "std": statistics.stdev(values),
+                        "values": values}
+        print(f"  {key:17s}: {summary[key]['mean']:.4f} +/- {summary[key]['std']:.4f}")
+    (out / "summary.json").write_text(json.dumps(summary, indent=2))
+    print(f"Summary saved in {out / 'summary.json'}")
 
 
 if __name__ == "__main__":

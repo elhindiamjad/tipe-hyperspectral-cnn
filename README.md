@@ -35,7 +35,8 @@ See [`data/README.md`](data/README.md) to download it.
    (zero padding at the borders). The CNN thus uses both the spectrum of the pixel and its
    spatial context. Patches are cut on the fly, which avoids storing a ~1 GB array in memory.
 3. **Split**: stratified 60 / 10 / 30 % train / validation / test split, so that every class
-   appears in each set in the same proportion.
+   appears in each set in the same proportion. Two spatially disjoint splits are also available
+   (`--split blocks` and `--split spatial`, see [Comparison of the splits](#comparison-of-three-splits)).
 4. **Model** (`hsi_cnn/model.py`):
 
    | Layer | Output shape |
@@ -58,13 +59,58 @@ Metrics on the test set (3,075 pixels never seen during training or model select
 
 | Metric | Value |
 |---|---|
-| Overall accuracy (OA) | 0.9986991869918699 |
-| Average accuracy (AA) | 0.999105887940183 |
-| Cohen's kappa | 0.9985169812876799 |
+| Overall accuracy (OA) | 99.87 % |
+| Average accuracy (AA) | 99.91 % |
+| Cohen's kappa | 0.9985 |
 
 *OA is the fraction of correctly classified pixels. AA is the mean of per-class accuracies,
 which gives the same weight to rare classes. Kappa measures agreement beyond chance.
 All values are written to `results/metrics.json` by `train.py`.*
+
+### Comparison of three splits
+
+With the random split, **every** test pixel has training pixels inside its 11 x 11 patch
+(55 on average), so the network has already seen most of each test neighborhood. Two spatially
+disjoint splits remove this overlap. In both, training and validation pixels closer than
+5 pixels to a test pixel are discarded, so that no test patch contains a training pixel.
+
+- `--split random` (default): stratified random split of the pixels (the protocol above).
+- `--split blocks`: the scene is cut into 16 x 16 blocks, and whole blocks go to train,
+  validation or test. Not stratified: a class lying in a single region ends up entirely in one
+  set. Four rare classes (Alfalfa, Corn, Grass-pasture-mowed, Oats) often have no training
+  pixel and stay in the test set, where they count as errors.
+- `--split spatial`: each class is cut along its longest axis into three contiguous regions
+  (30 % test, 10 % validation, 60 % train). Every class keeps a training region, except the
+  smallest ones (Alfalfa, Grass-pasture-mowed, and sometimes Oats): they are too small to leave
+  a 5-pixel gap between training and test, so they are removed from the evaluation.
+
+Mean +/- standard deviation over 5 seeds (0 to 4), 50 epochs each:
+
+| Split | OA | AA | Kappa |
+|---|---|---|---|
+| Random | 99.74 +/- 0.11 % | 99.44 +/- 0.19 % | 0.9970 +/- 0.0013 |
+| Blocks | 54.68 +/- 7.63 % | 43.71 +/- 3.90 % | 0.4668 +/- 0.0818 |
+| Spatial (per class) | 56.17 +/- 7.54 % | 64.18 +/- 6.51 % | 0.5068 +/- 0.0826 |
+
+```bash
+python train.py --seeds 0 1 2 3 4 --out-dir results/random_5seeds
+python train.py --split blocks --seeds 0 1 2 3 4 --out-dir results/blocks
+python train.py --split spatial --seeds 0 1 2 3 4 --out-dir results/spatial
+```
+
+What this shows:
+
+- **Most of the near-perfect score comes from the overlap** between training and test patches:
+  once it is removed, OA drops by more than 40 points with both spatial splits.
+- **The two spatial splits give a similar OA** (about 55 %), but a very different AA. With
+  blocks, the classes never seen in training score 0 and pull AA down; the per-class split
+  learns every class it evaluates, so its AA is higher. The AA values are therefore not
+  directly comparable: they are not computed on the same classes.
+- **The spatial results depend a lot on the seed** (+/- 7.5 points of OA against +/- 0.1 for
+  the random split), because the split itself changes a lot from one seed to another.
+
+Per-seed metrics and figures are in `results/random_5seeds/`, `results/blocks/` and
+`results/spatial/`, with the mean and standard deviation in each `summary.json`.
 
 ### Classification maps
 
@@ -81,7 +127,7 @@ All values are written to `results/metrics.json` by `train.py`.*
 ## Quick start
 
 ```bash
-git clone https://github.com/<elhindiamjad>/tipe-hyperspectral-cnn.git
+git clone https://github.com/elhindiamjad/tipe-hyperspectral-cnn.git
 cd tipe-hyperspectral-cnn
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -93,6 +139,7 @@ Options (all have defaults):
 
 ```bash
 python train.py --epochs 100 --lr 5e-4 --patch-size 9 --seed 0
+python train.py --split spatial --seeds 0 1 2 3 4   # several seeds -> summary.json
 python train.py --help
 ```
 
@@ -105,7 +152,7 @@ metrics (`metrics.json`), figures, and the best model weights (`best_model.pth`,
 .
 ├── train.py              # entry point: data -> training -> evaluation -> figures
 ├── hsi_cnn/
-│   ├── data.py           # loading, normalization, patch coordinates, stratified split
+│   ├── data.py           # loading, normalization, patch coordinates, random and spatial splits
 │   ├── dataset.py        # PyTorch Dataset cutting patches on the fly
 │   ├── model.py          # 2D CNN
 │   ├── engine.py         # training / evaluation / prediction loops
@@ -124,10 +171,10 @@ metrics (`metrics.json`), figures, and the best model weights (`best_model.pth`,
 - **Spatial overlap between train and test.** Pixels are split at random, so a test pixel
   often has neighbors in the training set, and their 11 x 11 patches largely overlap. This is
   the usual protocol on Indian Pines, but it makes the scores optimistic compared with a
-  model applied to a new area. A spatially disjoint split (separate regions of the image for
-  training and testing) would give a more realistic estimate.
-- **Single run.** Results depend on the random seed. Averaging several seeds would give a
-  mean and a standard deviation.
+  model applied to a new area. The spatially disjoint splits above give a more realistic
+  estimate (about 55 % OA instead of 99.7 %).
+- **Few seeds.** The comparison uses 5 seeds; the spatial scores vary a lot between seeds,
+  so more runs would narrow the estimate. The main results table above is a single run (seed 42).
 - **Ideas to explore**: dimensionality reduction with PCA before the CNN, 3D convolutions
   (joint spectral-spatial kernels), and other scenes (Pavia University, Salinas).
 
