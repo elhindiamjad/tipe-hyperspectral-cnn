@@ -81,7 +81,7 @@ All values are written to `results/metrics.json` by `train.py`.*
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-username>/tipe-hyperspectral-cnn.git
+git clone https://github.com/<elhindiamjad>/tipe-hyperspectral-cnn.git
 cd tipe-hyperspectral-cnn
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
